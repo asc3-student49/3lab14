@@ -161,7 +161,47 @@ class RobustWorkflowOrchestrator:
 
     async def execute(self, initial_context: Dict[str, Any]) -> Dict[str, Any]:
         """Execute workflow with error handling."""
-        # YOUR CODE HERE
+        context = initial_context.copy()
+        self.executed_steps.clear()
+        start_time = datetime.now()
+        context["_metadata"] = {
+            "start_time": start_time,
+            "steps_completed": [],
+            "steps_failed": [],
+        }
+
+        print(f"\n{'='*60}")
+        print(f"Starting workflow: {self.name}")
+        print(f"{'='*60}")
+
+        try:
+            total_steps = len(self.steps)
+            for i, step in enumerate(self.steps, 1):
+                print(f"\nStep {i}/{total_steps}: {step.name}")
+
+                try:
+                    output = await step.execute(context)
+                    context[f"{step.name}_result"] = output
+                    context["_metadata"]["steps_completed"].append(step.name)
+                    self.executed_steps.append(step)
+                except Exception:
+                    context["_metadata"]["steps_failed"].append(step.name)
+                    await self._rollback(context)
+                    context["_metadata"]["end_time"] = datetime.now()
+                    context["_metadata"]["status"] = "failed"
+                    return context
+
+            context["_metadata"]["end_time"] = datetime.now()
+            context["_metadata"]["status"] = "completed"
+            duration = (
+                context["_metadata"]["end_time"] - context["_metadata"]["start_time"]
+            ).total_seconds()
+            print(f"\nWorkflow completed in {duration:.2f}s")
+            return context
+
+        except Exception:
+            await self._rollback(context)
+            raise
 
     async def _rollback(self, context: Dict[str, Any]):
         """Rollback executed steps."""
