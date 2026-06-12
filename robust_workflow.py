@@ -13,7 +13,8 @@ Run: python robust_workflow.py
 
 import asyncio
 import json
-from typing import Dict, Any, Optional, Callable
+import inspect
+from typing import Dict, Any, Optional, Protocol, runtime_checkable
 from dataclasses import dataclass
 from datetime import datetime
 from pydantic_ai import Agent
@@ -85,16 +86,28 @@ class CircuitBreaker:
         return True
 
 
-class RobustWorkflowStep:
-    """Workflow step with error handling."""
+@runtime_checkable
+class SagaStep(Protocol):
+    """Contract for saga-aware steps with forward and compensating actions."""
+
+    name: str
+
+    async def execute(self, context: Dict[str, Any]) -> str:
+        ...
+
+    async def compensate(self, context: Dict[str, Any]) -> None:
+        ...
+
+
+class LLMSagaStep:
+    """Reusable saga step implementation with retries, fallback, and circuit breaker."""
 
     def __init__(
         self,
         name: str,
-        agent: Agent,
+        agent,
         prompt_template: str,
-        fallback_agent: Optional[Agent] = None,
-        compensation_action: Optional[Callable] = None,
+        fallback_agent=None,
         timeout_seconds: float = 30.0,
         max_retries: int = 2,
     ):
@@ -102,7 +115,6 @@ class RobustWorkflowStep:
         self.agent = agent
         self.prompt_template = prompt_template
         self.fallback_agent = fallback_agent
-        self.compensation_action = compensation_action
         self.timeout_seconds = timeout_seconds
         self.max_retries = max_retries
         self.circuit_breaker = CircuitBreaker()
@@ -155,10 +167,110 @@ class RobustWorkflowStep:
         raise RuntimeError(f"Step {self.name} failed completely")
 
     async def compensate(self, context: Dict[str, Any]):
-        """Execute compensation action."""
-        if self.compensation_action:
-            print(f"  ↶ Running compensation for {self.name}")
-            await self.compensation_action(context)
+        """Default no-op compensation for steps without side effects."""
+        print(f"  ↶ No compensation required for {self.name}")
+
+
+class ExtractSagaStep(LLMSagaStep):
+    """Extract stage with concrete compensation behavior."""
+
+    def __init__(self, agent, fallback_agent=None):
+        super().__init__(
+            name="extract",
+            agent=agent,
+            prompt_template="Extract key information from: {input_data}",
+            fallback_agent=fallback_agent,
+            timeout_seconds=10.0,
+            max_retries=2,
+        )
+
+    async def compensate(self, context: Dict[str, Any]) -> None:
+        print(f"  ↶ Running compensation for {self.name}")
+        context["active_resources"] = context.get("active_resources", 0) - 1
+        event = {
+            "step": "extract",
+            "action": "resource_decrement",
+            "active_resources": context["active_resources"],
+            "timestamp": datetime.now().isoformat(),
+        }
+
+        context.setdefault("rollback_order", []).append("extract")
+        print("    Undo extract: decremented active_resources")
+
+        artifacts = Path("rollback_artifacts")
+        artifacts.mkdir(exist_ok=True)
+        with (artifacts / "undo_extract.json").open("w", encoding="utf-8") as f:
+            json.dump(event, f, indent=2)
+
+        await asyncio.sleep(0.2)
+
+
+class TransformSagaStep(LLMSagaStep):
+    """Transform stage with concrete compensation behavior."""
+
+    def __init__(self, agent, fallback_agent=None):
+        super().__init__(
+            name="transform",
+            agent=agent,
+            prompt_template="Transform this data: {extract_result}",
+            fallback_agent=fallback_agent,
+            timeout_seconds=10.0,
+            max_retries=2,
+        )
+
+    async def compensate(self, context: Dict[str, Any]) -> None:
+        print(f"  ↶ Running compensation for {self.name}")
+        event = {
+            "step": "transform",
+            "action": "reversal_event_posted",
+            "timestamp": datetime.now().isoformat(),
+        }
+
+        context.setdefault("reversal_events", []).append(event)
+        context.setdefault("rollback_order", []).append("transform")
+        print("    Undo transform: posted simulated reversal event")
+
+        artifacts = Path("rollback_artifacts")
+        artifacts.mkdir(exist_ok=True)
+        with (artifacts / "reversal_events.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(event) + "\n")
+
+        await asyncio.sleep(0.2)
+
+
+class SummarizeSagaStep(LLMSagaStep):
+    """Summary stage that intentionally fails to demonstrate rollback."""
+
+    def __init__(self, agent, fallback_agent=None):
+        super().__init__(
+            name="summarize",
+            agent=agent,
+            prompt_template="Summarize: {transform_result}",
+            fallback_agent=fallback_agent,
+            timeout_seconds=10.0,
+            max_retries=2,
+        )
+
+
+class FakeResult:
+    """Simple result wrapper matching the pydantic_ai Agent result shape."""
+
+    def __init__(self, output: str):
+        self.output = output
+
+
+class EchoAgent:
+    """Agent stub that always succeeds with deterministic output."""
+
+    async def run(self, prompt: str):
+        return FakeResult(f"OK: {prompt}")
+
+
+class AlwaysFailAgent:
+    """Agent stub that always fails to trigger rollback."""
+
+    async def run(self, prompt: str):
+        raise RuntimeError("Forced summarize failure for rollback validation")
 
 
 class RobustWorkflowOrchestrator:
@@ -166,11 +278,29 @@ class RobustWorkflowOrchestrator:
 
     def __init__(self, name: str):
         self.name = name
-        self.steps: list[RobustWorkflowStep] = []
-        self.executed_steps: list[RobustWorkflowStep] = []
+        self.steps: list[SagaStep] = []
+        self.executed_steps: list[SagaStep] = []
 
-    def add_step(self, step: RobustWorkflowStep):
-        """Add step to workflow."""
+    @staticmethod
+    def _is_valid_saga_step(step: object) -> bool:
+        """Ensure execute/compensate are both implemented as coroutines."""
+        execute_method = getattr(step, "execute", None)
+        compensate_method = getattr(step, "compensate", None)
+        return (
+            hasattr(step, "name")
+            and callable(execute_method)
+            and callable(compensate_method)
+            and inspect.iscoroutinefunction(execute_method)
+            and inspect.iscoroutinefunction(compensate_method)
+        )
+
+    def add_step(self, step: SagaStep):
+        """Add step to workflow with upfront saga-contract validation."""
+        if not self._is_valid_saga_step(step):
+            raise TypeError(
+                "Invalid saga step. Each step must provide async execute(context) "
+                "and async compensate(context) methods."
+            )
         self.steps.append(step)
         return self
 
@@ -237,98 +367,28 @@ class RobustWorkflowOrchestrator:
 async def example():
     """Demonstrate robust workflow."""
 
-    class AlwaysFailAgent:
-        """Agent stub that always fails to trigger rollback."""
-
-        async def run(self, prompt: str):
-            raise RuntimeError("Forced summarize failure for rollback validation")
-
-    # Create agents
-    primary_agent = Agent(
-        os.getenv("AI_MODEL", "openai:gpt-5.4-mini"),
-        system_prompt="You are a helpful assistant.",
-    )
-
-    fallback_agent = Agent(
-        "test",  # Use test model as fallback
-        system_prompt="You are a simple fallback assistant.",
-    )
-
-    # Compensation actions
-    async def compensate_step1(ctx):
-        ctx["active_resources"] = ctx.get("active_resources", 0) - 1
-        event = {
-            "step": "extract",
-            "action": "resource_decrement",
-            "active_resources": ctx["active_resources"],
-            "timestamp": datetime.now().isoformat(),
-        }
-
-        ctx.setdefault("rollback_order", []).append("extract")
-        print("    Undo extract: decremented active_resources")
-
-        artifacts = Path("rollback_artifacts")
-        artifacts.mkdir(exist_ok=True)
-        with (artifacts / "undo_extract.json").open("w", encoding="utf-8") as f:
-            json.dump(event, f, indent=2)
-
-        await asyncio.sleep(0.2)
-
-    async def compensate_step2(ctx):
-        event = {
-            "step": "transform",
-            "action": "reversal_event_posted",
-            "timestamp": datetime.now().isoformat(),
-        }
-
-        ctx.setdefault("reversal_events", []).append(event)
-        ctx.setdefault("rollback_order", []).append("transform")
-        print("    Undo transform: posted simulated reversal event")
-
-        artifacts = Path("rollback_artifacts")
-        artifacts.mkdir(exist_ok=True)
-        with (artifacts / "reversal_events.jsonl").open("a", encoding="utf-8") as f:
-            f.write(json.dumps(event) + "\n")
-
-        await asyncio.sleep(0.2)
+    # Create deterministic local agents for reliable demonstration.
+    primary_agent = EchoAgent()
+    fallback_agent = EchoAgent()
 
     # Build workflow
     workflow = RobustWorkflowOrchestrator("Data Processing Pipeline")
 
-    workflow.add_step(
-        RobustWorkflowStep(
-            name="extract",
-            agent=primary_agent,
-            prompt_template="Extract key information from: {input_data}",
-            fallback_agent=fallback_agent,
-            compensation_action=compensate_step1,
-            timeout_seconds=10.0,
-            max_retries=2,
-        )
-    )
+    workflow.add_step(ExtractSagaStep(agent=primary_agent, fallback_agent=fallback_agent))
+    workflow.add_step(TransformSagaStep(agent=primary_agent, fallback_agent=fallback_agent))
+    workflow.add_step(SummarizeSagaStep(agent=AlwaysFailAgent(), fallback_agent=None))
 
-    workflow.add_step(
-        RobustWorkflowStep(
-            name="transform",
-            agent=primary_agent,
-            prompt_template="Transform this data: {extract_result}",
-            fallback_agent=fallback_agent,
-            compensation_action=compensate_step2,
-            timeout_seconds=10.0,
-            max_retries=2,
-        )
-    )
+    # Demonstrate early contract rejection: missing compensate() is blocked before run.
+    class InvalidExecuteOnlyStep:
+        name = "invalid"
 
-    workflow.add_step(
-        RobustWorkflowStep(
-            name="summarize",
-            agent=AlwaysFailAgent(),
-            prompt_template="Summarize: {transform_result}",
-            fallback_agent=None,
-            timeout_seconds=10.0,
-            max_retries=2,
-        )
-    )
+        async def execute(self, context: Dict[str, Any]) -> str:
+            return "should never run"
+
+    try:
+        workflow.add_step(InvalidExecuteOnlyStep())
+    except TypeError as exc:
+        print(f"Contract check: rejected invalid step registration ({exc})")
 
     # Execute
     result = await workflow.execute(
