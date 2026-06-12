@@ -32,35 +32,55 @@ class CircuitBreaker:
     failures: int = 0
     last_failure: Optional[datetime] = None
     is_open: bool = False
+    is_half_open: bool = False
+    probe_in_flight: bool = False
 
     def record_success(self):
         """Record successful execution."""
         self.failures = 0
         self.is_open = False
+        self.is_half_open = False
+        self.probe_in_flight = False
 
     def record_failure(self):
         """Record failure."""
         self.failures += 1
         self.last_failure = datetime.now()
 
-        if self.failures >= self.failure_threshold:
+        # Any failure while half-open re-opens immediately.
+        if self.is_half_open or self.failures >= self.failure_threshold:
             self.is_open = True
+            self.is_half_open = False
+            self.probe_in_flight = False
 
     def can_execute(self) -> bool:
         """Check if execution is allowed."""
-        if not self.is_open:
+        # Closed state: execute normally.
+        if not self.is_open and not self.is_half_open:
             return True
 
-        # Check if timeout has passed
-        if self.last_failure:
-            elapsed = (datetime.now() - self.last_failure).total_seconds()
-            if elapsed >= self.timeout_seconds:
-                # Half-open state - allow one attempt
-                self.is_open = False
-                self.failures = self.failure_threshold - 1
-                return True
+        # Open state: allow transition to half-open only after timeout window.
+        if self.is_open:
+            if not self.last_failure:
+                return False
 
-        return False
+            elapsed = (datetime.now() - self.last_failure).total_seconds()
+            if elapsed < self.timeout_seconds:
+                return False
+
+            # Transition to half-open and allow one probe call.
+            self.is_open = False
+            self.is_half_open = True
+            self.probe_in_flight = False
+
+        # Half-open state: allow exactly one in-flight probe.
+        if self.is_half_open:
+            if self.probe_in_flight:
+                return False
+            self.probe_in_flight = True
+            return True
+
+        return True
 
 
 class RobustWorkflowStep:
@@ -87,55 +107,48 @@ class RobustWorkflowStep:
 
     async def execute(self, context: Dict[str, Any]) -> str:
         """Execute step with error handling."""
-        # Check circuit breaker
         if not self.circuit_breaker.can_execute():
-            raise RuntimeError(f"Circuit breaker open for {self.name}")
+            raise RuntimeError(f"Step {self.name} cannot execute: circuit breaker is open")
 
-        # Format prompt
         prompt = self.prompt_template.format(**context)
+        attempts = self.max_retries + 1
 
-        # Try main agent with retries
-        for attempt in range(self.max_retries + 1):
+        for attempt in range(attempts):
+            attempt_number = attempt + 1
+
             try:
-                # Execute with timeout
                 result = await asyncio.wait_for(
                     self.agent.run(prompt), timeout=self.timeout_seconds
                 )
-
                 self.circuit_breaker.record_success()
                 return result.output
 
             except asyncio.TimeoutError:
                 if attempt < self.max_retries:
-                    print(f"  ⏱ Timeout on attempt {attempt + 1}, retrying...")
-                    continue
+                    print(f"  Timeout on attempt {attempt_number}/{attempts}; retrying...")
                 else:
-                    print(f"  ⏱ Timeout after {self.max_retries + 1} attempts")
-                    break
+                    print(f"  Timeout on final attempt {attempt_number}/{attempts}")
 
-            except Exception as e:
+            except Exception as exc:
                 if attempt < self.max_retries:
-                    print(f"  ⚠ Error on attempt {attempt + 1}: {e}")
-                    await asyncio.sleep(2**attempt)  # Exponential backoff
-                    continue
+                    print(f"  Error on attempt {attempt_number}/{attempts}: {exc}")
+                    await asyncio.sleep(2**attempt)
                 else:
-                    print(f"  ✗ Failed after {self.max_retries + 1} attempts")
-                    break
+                    print(f"  Error on final attempt {attempt_number}/{attempts}: {exc}")
 
-        # Record failure
         self.circuit_breaker.record_failure()
 
-        # Try fallback agent
-        if self.fallback_agent:
-            print(f"  🔄 Using fallback agent...")
+        if self.fallback_agent is not None:
+            print("  Using fallback agent...")
             try:
-                result = await asyncio.wait_for(
+                fallback_result = await asyncio.wait_for(
                     self.fallback_agent.run(prompt), timeout=self.timeout_seconds
                 )
-                return result.output
-
-            except Exception as e:
-                print(f"  ✗ Fallback also failed: {e}")
+                return fallback_result.output
+            except asyncio.TimeoutError:
+                print("  Fallback timed out")
+            except Exception as exc:
+                print(f"  Fallback failed: {exc}")
 
         raise RuntimeError(f"Step {self.name} failed completely")
 
