@@ -12,11 +12,13 @@ Run: python robust_workflow.py
 """
 
 import asyncio
+import json
 from typing import Dict, Any, Optional, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pydantic_ai import Agent
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -218,14 +220,13 @@ class RobustWorkflowOrchestrator:
 
     async def _rollback(self, context: Dict[str, Any]):
         """Rollback executed steps."""
-        if not self.executed_steps:
+        if len(self.executed_steps) == 0:
             return
 
         print(f"\n{'='*60}")
         print(f"  Rolling Back {len(self.executed_steps)} Steps")
         print(f"{'='*60}\n")
 
-        # Compensate in reverse order
         for step in reversed(self.executed_steps):
             await step.compensate(context)
 
@@ -235,6 +236,12 @@ class RobustWorkflowOrchestrator:
 # Example workflow
 async def example():
     """Demonstrate robust workflow."""
+
+    class AlwaysFailAgent:
+        """Agent stub that always fails to trigger rollback."""
+
+        async def run(self, prompt: str):
+            raise RuntimeError("Forced summarize failure for rollback validation")
 
     # Create agents
     primary_agent = Agent(
@@ -249,12 +256,41 @@ async def example():
 
     # Compensation actions
     async def compensate_step1(ctx):
-        print("    Undoing step 1...")
-        await asyncio.sleep(0.5)
+        ctx["active_resources"] = ctx.get("active_resources", 0) - 1
+        event = {
+            "step": "extract",
+            "action": "resource_decrement",
+            "active_resources": ctx["active_resources"],
+            "timestamp": datetime.now().isoformat(),
+        }
+
+        ctx.setdefault("rollback_order", []).append("extract")
+        print("    Undo extract: decremented active_resources")
+
+        artifacts = Path("rollback_artifacts")
+        artifacts.mkdir(exist_ok=True)
+        with (artifacts / "undo_extract.json").open("w", encoding="utf-8") as f:
+            json.dump(event, f, indent=2)
+
+        await asyncio.sleep(0.2)
 
     async def compensate_step2(ctx):
-        print("    Undoing step 2...")
-        await asyncio.sleep(0.5)
+        event = {
+            "step": "transform",
+            "action": "reversal_event_posted",
+            "timestamp": datetime.now().isoformat(),
+        }
+
+        ctx.setdefault("reversal_events", []).append(event)
+        ctx.setdefault("rollback_order", []).append("transform")
+        print("    Undo transform: posted simulated reversal event")
+
+        artifacts = Path("rollback_artifacts")
+        artifacts.mkdir(exist_ok=True)
+        with (artifacts / "reversal_events.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(event) + "\n")
+
+        await asyncio.sleep(0.2)
 
     # Build workflow
     workflow = RobustWorkflowOrchestrator("Data Processing Pipeline")
@@ -286,20 +322,26 @@ async def example():
     workflow.add_step(
         RobustWorkflowStep(
             name="summarize",
-            agent=primary_agent,
+            agent=AlwaysFailAgent(),
             prompt_template="Summarize: {transform_result}",
-            fallback_agent=fallback_agent,
+            fallback_agent=None,
             timeout_seconds=10.0,
             max_retries=2,
         )
     )
 
     # Execute
-    result = await workflow.execute({"input_data": "Sample customer feedback data..."})
+    result = await workflow.execute(
+        {
+            "input_data": "Sample customer feedback data...",
+            "active_resources": 1,
+        }
+    )
 
     print("\nFinal Result:")
     print(f"Status: {result['_metadata']['status']}")
     print(f"Steps completed: {result['_metadata']['steps_completed']}")
+    print(f"Rollback order: {result.get('rollback_order', [])}")
 
 
 if __name__ == "__main__":
